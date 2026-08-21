@@ -1,4 +1,4 @@
-# TaskFlow API — CI/CD DevOps Pipeline Project
+# TaskBoard — CI/CD DevOps Pipeline Project
 
 A small Flask REST API used as a real-world vehicle to build a complete,
 production-style CI/CD pipeline with Jenkins.
