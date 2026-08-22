@@ -25,5 +25,11 @@ pipeline {
                 sh '.venv/bin/pytest tests/test_app.py'
             }
         }
+
+        stage('Code Quality') {
+            steps {
+                sh '.venv/bin/ruff check app.py tests/'
+            }
+        }
     }
 }
