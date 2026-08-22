@@ -11,13 +11,17 @@ pipeline {
 
         stage('Install Dependencies') {
             steps {
-                sh 'pip install -r requirements-dev.txt'
+                sh '''
+                    python3 -m venv .venv
+                    .venv/bin/pip install --upgrade pip
+                    .venv/bin/pip install -r requirements-dev.txt
+                '''
             }
         }
 
         stage('Unit Tests') {
             steps {
-                sh 'pytest tests/test_app.py'
+                sh '.venv/bin/pytest tests/test_app.py'
             }
         }
     }
