@@ -20,9 +20,14 @@ pipeline {
             }
         }
 
-        stage('Unit Tests') {
+        stage('Unit Tests + Coverage') {
             steps {
-                sh '.venv/bin/pytest tests/test_app.py'
+                sh '''
+                    .venv/bin/pytest tests/test_app.py \
+                        --cov=app \
+                        --cov-report=term \
+                        --cov-report=html
+                '''
             }
         }
 
