@@ -5,8 +5,9 @@ E2E tests, Dockerized deployment.
 """
 import os
 import sqlite3
-from datetime import datetime
-from flask import Flask, jsonify, request, g
+from datetime import datetime, timezone
+
+from flask import Flask, g, jsonify, request
 
 app = Flask(__name__)
 DATABASE = os.environ.get("DATABASE_PATH", "taskboard.db")
@@ -65,7 +66,7 @@ def create_task():
     db = get_db()
     cur = db.execute(
         "INSERT INTO tasks (title, done, created_at) VALUES (?, 0, ?)",
-        (title, datetime.utcnow().isoformat()),
+        (title, datetime.now(timezone.utc).isoformat()),
     )
     db.commit()
     new_task = db.execute(
