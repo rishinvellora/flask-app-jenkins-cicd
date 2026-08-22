@@ -29,20 +29,20 @@ pipeline {
                         --cov-report=html
                 '''
             }
-        }
 
             post {
                 always {
-                   publishHTML(target: [
-                      reportDir: 'htmlcov',
-                      reportFiles: 'index.html',
-                      reportName: 'Coverage Report',
-                      keepAll: true,
-                      alwaysLinkToLastBuild: true
-                   ])
+                    publishHTML(target: [
+                        reportDir: 'htmlcov',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report',
+                        keepAll: true,
+                        alwaysLinkToLastBuild: true
+                    ])
                 }
             }
-        
+        }
+
         stage('Code Quality') {
             steps {
                 sh '.venv/bin/ruff check app.py tests/'
