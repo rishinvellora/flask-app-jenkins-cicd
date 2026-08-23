@@ -59,7 +59,7 @@ pipeline {
 	    steps {
 	        sh '''
 		    docker build -t taskboard:${BUILD_NUMBER} .
-		    docker tag taksboard:${BUILD_NUMBER} taskboard:latest
+		    docker tag taskboard:${BUILD_NUMBER} taskboard:latest
 		'''
 	    }
 	} 
