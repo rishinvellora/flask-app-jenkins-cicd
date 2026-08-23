@@ -48,5 +48,12 @@ pipeline {
                 sh '.venv/bin/ruff check app.py tests/'
             }
         }
+
+        stage('Dependency vulnerability scan') {
+	    steps {
+	        sh '.venv/bin/pip-audit -r requirements.txt'
+	    }
+	}		    
+
     }
 }
