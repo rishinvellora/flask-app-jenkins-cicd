@@ -54,6 +54,14 @@ pipeline {
 	        sh '.venv/bin/pip-audit -r requirements.txt'
 	    }
 	}		    
-
+        
+        stage('Build docker image') {
+	    steps {
+	        sh '''
+		    docker build -t taskboard:${BUILD_NUMBER} .
+		    docker tag taksboard:${BUILD_NUMBER} taskboard:latest
+		'''
+	    }
+	} 
     }
 }
