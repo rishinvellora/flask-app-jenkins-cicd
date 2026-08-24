@@ -62,6 +62,16 @@ pipeline {
 		    docker tag taskboard:${BUILD_NUMBER} taskboard:latest
 		'''
 	    }
-	} 
+	}
+
+	stage('Docker image vulnerability scan') {
+	    steps { 
+		sh '''
+		    trivy image --severity HIGH,CRITICAL \
+		    --exit-code 1 \
+		    taskboard:{BUILD_NUMBER}
+		'''
+	    }
+	}
     }
 }
