@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "rishinvellora/taskboard"
+        IMAGE_NAME = "rishinraj/taskboard"
         IMAGE_TAG  = "${BUILD_NUMBER}"
         VM2_HOST   = "10.0.1.96"
     }
