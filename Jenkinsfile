@@ -66,7 +66,7 @@ pipeline {
 
 	stage('Image Vulnerability Scan') {
             steps {
-        	sh '''
+	        sh '''
                     trivy image \
                     --cache-dir /var/cache/trivy \
                     --severity HIGH,CRITICAL \
