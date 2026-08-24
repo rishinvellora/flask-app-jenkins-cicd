@@ -69,7 +69,7 @@ pipeline {
 		sh '''
 		    trivy image --severity HIGH,CRITICAL \
 		    --exit-code 1 \
-		    taskboard:{BUILD_NUMBER}
+		    taskboard:${BUILD_NUMBER}
 		'''
 	    }
 	}
