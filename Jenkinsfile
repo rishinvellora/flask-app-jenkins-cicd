@@ -64,15 +64,16 @@ pipeline {
 	    }
 	}
 
-	stage('Docker image vulnerability scan') {
-	    steps { 
-		sh '''
-		    trivy image --severity HIGH,CRITICAL \
+	stage('Image Vulnerability Scan') {
+            steps {
+        	sh '''
+                    trivy image \
                     --cache-dir /var/cache/trivy \
-		    --exit-code 1 \
-		    taskboard:${BUILD_NUMBER}
-		'''
-	    }
-	}
+                    --severity HIGH,CRITICAL \
+                    --exit-code 1 \
+                    taskboard:${BUILD_NUMBER}
+                '''
+            }
+        }
     }
 }
