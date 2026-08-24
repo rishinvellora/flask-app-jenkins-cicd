@@ -2,8 +2,9 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "rishinraj/taskboard"
+        IMAGE_NAME = "rishinvellora/taskboard"
         IMAGE_TAG  = "${BUILD_NUMBER}"
+        VM2_HOST   = "10.0.1.96"
     }
 
     stages {
@@ -110,19 +111,43 @@ pipeline {
                 }
             }
         }
+
+        stage('Deploy to VM2') {
+            steps {
+                sshagent(credentials: ['vm2-ssh-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${VM2_HOST} "
+                                docker pull ${IMAGE_NAME}:latest &&
+                                docker stop taskboard || true &&
+                                docker rm taskboard || true &&
+                                docker run -d \
+                                    --name taskboard \
+                                    -p 5000:5000 \
+                                    --restart unless-stopped \
+                                    ${IMAGE_NAME}:latest
+                            "
+                    '''
+                }
+            }
+        }
     }
 
     post {
         always {
-            archiveArtifacts artifacts: 'htmlcov/**', allowEmptyArchive: true
+            archiveArtifacts(
+                artifacts: 'htmlcov/**',
+                allowEmptyArchive: true
+            )
         }
 
         success {
-            echo "Pipeline succeeded — TaskBoard image ${IMAGE_NAME}:${IMAGE_TAG} pushed to Docker Hub."
+            echo "Pipeline succeeded."
+            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} deployed to VM2."
         }
 
         failure {
-            echo "Pipeline failed — check the failed stage and logs."
+            echo "Pipeline failed. Check the failed stage and logs."
         }
     }
 }
