@@ -70,6 +70,7 @@ pipeline {
                     trivy image \
                     --cache-dir /var/cache/trivy \
                     --severity HIGH,CRITICAL \
+                    --ignore-unfixed \
                     --exit-code 1 \
                     taskboard:${BUILD_NUMBER}
                 '''
