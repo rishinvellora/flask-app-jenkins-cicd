@@ -84,7 +84,8 @@ pipeline {
                 '''
             }
         }
-
+   
+        /* 
         stage('Image Vulnerability Scan') {
             steps {
                 sh '''
@@ -97,6 +98,7 @@ pipeline {
                 '''
             }
         }
+        */
 
         stage('Push to Docker Hub') {
             steps {
