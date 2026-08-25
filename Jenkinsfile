@@ -4,7 +4,8 @@ pipeline {
     environment {
         IMAGE_NAME = "rishinraj/taskboard"
         IMAGE_TAG  = "${BUILD_NUMBER}"
-        VM2_HOST   = "10.0.1.96"
+        APP_A_HOST = "10.0.1.142"
+        APP_B_HOST = "10.0.3.38"
     }
 
     stages {
@@ -112,21 +113,33 @@ pipeline {
             }
         }
 
-        stage('Deploy to VM2') {
-            steps {
-                sshagent(credentials: ['vm2-ssh-key']) {
+        stage('Deploy to Application Servers') {
+	    steps {
+                sshagent(credentials: ['taskboard-deploy-key']) {
                     sh '''
-                        ssh -o StrictHostKeyChecking=no \
-                            ubuntu@${VM2_HOST} "
-                                docker pull ${IMAGE_NAME}:latest &&
-                                docker stop taskboard || true &&
-                                docker rm taskboard || true &&
-                                docker run -d \
-                                    --name taskboard \
-                                    -p 5000:5000 \
-                                    --restart unless-stopped \
-                                    ${IMAGE_NAME}:latest
-                            "
+                        for HOST in "$APP_A_HOST" "$APP_B_HOST"; do
+                            echo "Deploying TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} to ${HOST}"
+
+                            ssh -o StrictHostKeyChecking=no \
+                                ubuntu@${HOST} "
+                                    docker pull ${IMAGE_NAME}:${IMAGE_TAG} &&
+                                    docker stop taskboard || true &&
+                                    docker rm taskboard || true &&
+                                    docker run -d \
+                                        --name taskboard \
+                                        -p 5000:5000 \
+                                        --restart unless-stopped \
+                                        ${IMAGE_NAME}:${IMAGE_TAG}
+                                "
+
+                            echo "Checking application health on ${HOST}..."
+
+                            ssh -o StrictHostKeyChecking=no \
+                                ubuntu@${HOST} \
+                                "curl --fail --silent http://localhost:5000/health"
+
+                            echo "Health check passed on ${HOST}"
+                        done
                     '''
                 }
             }
@@ -143,7 +156,7 @@ pipeline {
 
         success {
             echo "Pipeline succeeded."
-            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} deployed to VM2."
+            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} deployed to both application servers."
         }
 
         failure {
