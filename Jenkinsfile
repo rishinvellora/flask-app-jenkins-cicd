@@ -4,7 +4,7 @@ pipeline {
     environment {
         IMAGE_NAME = "rishinraj/taskboard"
         IMAGE_TAG  = "${BUILD_NUMBER}"
-        VM2_HOST   = "10.0.1.96"
+        VM2_HOST   = "Private Ip"
     }
 
     stages {
