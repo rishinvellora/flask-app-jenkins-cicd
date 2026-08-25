@@ -158,9 +158,11 @@ pipeline {
 
                             ssh -o StrictHostKeyChecking=no \
                                 ubuntu@"${HOST}" "
-                                    docker pull ${IMAGE_NAME}:${IMAGE_TAG} &&
-                                    docker stop taskboard || true &&
-                                    docker rm taskboard || true &&
+                                    docker pull ${IMAGE_NAME}:${IMAGE_TAG}
+
+                                    docker stop taskboard || true
+                                    docker rm taskboard || true
+
                                     docker run -d \
                                         --name taskboard \
                                         -p 5000:5000 \
@@ -172,7 +174,7 @@ pipeline {
 
                             ssh -o StrictHostKeyChecking=no \
                                 ubuntu@"${HOST}" '
-                                    for i in {1..15}; do
+                                    for i in $(seq 1 15); do
 
                                         if curl \
                                             --fail \
@@ -207,7 +209,7 @@ pipeline {
 
                             echo "Waiting for ALB health check..."
 
-                            for i in {1..15}; do
+                            for i in $(seq 1 15); do
 
                                 STATE=$(aws elbv2 describe-target-health \
                                     --target-group-arn "${TARGET_GROUP_ARN}" \
