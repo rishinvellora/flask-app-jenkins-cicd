@@ -4,6 +4,7 @@ pipeline {
     environment {
         IMAGE_NAME = "rishinraj/taskboard"
         IMAGE_TAG  = "${BUILD_NUMBER}"
+
         APP_A_HOST = "10.0.1.142"
         APP_B_HOST = "10.0.3.38"
     }
@@ -88,11 +89,13 @@ pipeline {
 
         stage('Push to Docker Hub') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-creds',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
                     sh '''
                         echo "$DOCKER_PASS" | docker login \
                             -u "$DOCKER_USER" \
@@ -114,11 +117,16 @@ pipeline {
         }
 
         stage('Deploy to Application Servers') {
-	    steps {
+            steps {
                 sshagent(credentials: ['taskboard-deploy-key']) {
+
                     sh '''
                         for HOST in "$APP_A_HOST" "$APP_B_HOST"; do
-                            echo "Deploying TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} to ${HOST}"
+
+                            echo "=========================================="
+                            echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG}"
+                            echo "Target: ${HOST}"
+                            echo "=========================================="
 
                             ssh -o StrictHostKeyChecking=no \
                                 ubuntu@${HOST} "
@@ -132,13 +140,34 @@ pipeline {
                                         ${IMAGE_NAME}:${IMAGE_TAG}
                                 "
 
-                            echo "Checking application health on ${HOST}..."
+                            echo "Waiting for TaskBoard to become healthy on ${HOST}..."
 
                             ssh -o StrictHostKeyChecking=no \
-                                ubuntu@${HOST} \
-                                "curl --fail --silent http://localhost:5000/health"
+                                ubuntu@${HOST} '
+                                    for i in {1..15}; do
 
-                            echo "Health check passed on ${HOST}"
+                                        if curl \
+                                            --fail \
+                                            --silent \
+                                            http://localhost:5000/health; then
+
+                                            echo
+                                            echo "TaskBoard is healthy."
+                                            exit 0
+                                        fi
+
+                                        echo "Attempt $i/15: application not ready yet..."
+                                        sleep 2
+                                    done
+
+                                    echo "TaskBoard failed health check."
+                                    echo "Container logs:"
+                                    docker logs taskboard
+
+                                    exit 1
+                                '
+
+                            echo "Deployment successful on ${HOST}"
                         done
                     '''
                 }
@@ -147,6 +176,7 @@ pipeline {
     }
 
     post {
+
         always {
             archiveArtifacts(
                 artifacts: 'htmlcov/**',
@@ -155,12 +185,18 @@ pipeline {
         }
 
         success {
+            echo "=========================================="
             echo "Pipeline succeeded."
-            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} deployed to both application servers."
+            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "deployed successfully to both application servers."
+            echo "=========================================="
         }
 
         failure {
-            echo "Pipeline failed. Check the failed stage and logs."
+            echo "=========================================="
+            echo "Pipeline failed."
+            echo "Check the failed stage and Jenkins logs."
+            echo "=========================================="
         }
     }
 }
