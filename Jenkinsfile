@@ -7,6 +7,11 @@ pipeline {
 
         APP_A_HOST = "10.0.1.142"
         APP_B_HOST = "10.0.3.38"
+
+        APP_A_ID = "i-0db344a04b6533b27"
+        APP_B_ID = "i-001b1fd77976b2a33"
+
+        TARGET_GROUP_ARN = "arn:aws:elasticloadbalancing:ap-south-1:456687462288:targetgroup/taskboard-tg/30ba23715c142c08"
     }
 
     stages {
@@ -21,7 +26,9 @@ pipeline {
             steps {
                 sh '''
                     python3 -m venv .venv
+
                     .venv/bin/pip install --upgrade pip
+
                     .venv/bin/pip install -r requirements.txt
                     .venv/bin/pip install -r requirements-dev.txt
                 '''
@@ -53,13 +60,17 @@ pipeline {
 
         stage('Code Quality') {
             steps {
-                sh '.venv/bin/ruff check app.py tests/'
+                sh '''
+                    .venv/bin/ruff check app.py tests/
+                '''
             }
         }
 
         stage('Dependency Vulnerability Scan') {
             steps {
-                sh '.venv/bin/pip-audit -r requirements.txt'
+                sh '''
+                    .venv/bin/pip-audit -r requirements.txt
+                '''
             }
         }
 
@@ -116,20 +127,37 @@ pipeline {
             }
         }
 
-        stage('Deploy to Application Servers') {
+        stage('Rolling Deployment') {
             steps {
                 sshagent(credentials: ['taskboard-deploy-key']) {
 
                     sh '''
-                        for HOST in "$APP_A_HOST" "$APP_B_HOST"; do
+                        set -e
+
+                        deploy_server() {
+                            HOST="$1"
+                            INSTANCE_ID="$2"
 
                             echo "=========================================="
-                            echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG}"
-                            echo "Target: ${HOST}"
+                            echo "Starting deployment"
+                            echo "Host: ${HOST}"
+                            echo "Instance: ${INSTANCE_ID}"
+                            echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
                             echo "=========================================="
+
+                            echo "Deregistering ${INSTANCE_ID} from ALB..."
+
+                            aws elbv2 deregister-targets \
+                                --target-group-arn "${TARGET_GROUP_ARN}" \
+                                --targets Id="${INSTANCE_ID}"
+
+                            echo "Waiting for existing connections to drain..."
+                            sleep 10
+
+                            echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG}..."
 
                             ssh -o StrictHostKeyChecking=no \
-                                ubuntu@${HOST} "
+                                ubuntu@"${HOST}" "
                                     docker pull ${IMAGE_NAME}:${IMAGE_TAG} &&
                                     docker stop taskboard || true &&
                                     docker rm taskboard || true &&
@@ -140,10 +168,10 @@ pipeline {
                                         ${IMAGE_NAME}:${IMAGE_TAG}
                                 "
 
-                            echo "Waiting for TaskBoard to become healthy on ${HOST}..."
+                            echo "Waiting for application health..."
 
                             ssh -o StrictHostKeyChecking=no \
-                                ubuntu@${HOST} '
+                                ubuntu@"${HOST}" '
                                     for i in {1..15}; do
 
                                         if curl \
@@ -152,7 +180,7 @@ pipeline {
                                             http://localhost:5000/health; then
 
                                             echo
-                                            echo "TaskBoard is healthy."
+                                            echo "Application health check passed."
                                             exit 0
                                         fi
 
@@ -160,15 +188,64 @@ pipeline {
                                         sleep 2
                                     done
 
-                                    echo "TaskBoard failed health check."
+                                    echo "Application failed health check."
+
+                                    echo "Container status:"
+                                    docker ps -a
+
                                     echo "Container logs:"
                                     docker logs taskboard
 
                                     exit 1
                                 '
 
-                            echo "Deployment successful on ${HOST}"
-                        done
+                            echo "Registering ${INSTANCE_ID} with ALB..."
+
+                            aws elbv2 register-targets \
+                                --target-group-arn "${TARGET_GROUP_ARN}" \
+                                --targets Id="${INSTANCE_ID}"
+
+                            echo "Waiting for ALB health check..."
+
+                            for i in {1..15}; do
+
+                                STATE=$(aws elbv2 describe-target-health \
+                                    --target-group-arn "${TARGET_GROUP_ARN}" \
+                                    --targets Id="${INSTANCE_ID}" \
+                                    --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+                                    --output text)
+
+                                echo "ALB target state: ${STATE}"
+
+                                if [ "${STATE}" = "healthy" ]; then
+                                    echo "ALB considers ${HOST} healthy."
+                                    return 0
+                                fi
+
+                                sleep 5
+                            done
+
+                            echo "ALB health check failed for ${HOST}."
+
+                            return 1
+                        }
+
+                        echo "=========================================="
+                        echo "Rolling deployment started"
+                        echo "Version: ${IMAGE_NAME}:${IMAGE_TAG}"
+                        echo "=========================================="
+
+                        deploy_server "${APP_A_HOST}" "${APP_A_ID}"
+
+                        echo "App-A deployment successful."
+                        echo "Proceeding to App-B..."
+
+                        deploy_server "${APP_B_HOST}" "${APP_B_ID}"
+
+                        echo "=========================================="
+                        echo "Rolling deployment completed successfully."
+                        echo "Version: ${IMAGE_NAME}:${IMAGE_TAG}"
+                        echo "=========================================="
                     '''
                 }
             }
