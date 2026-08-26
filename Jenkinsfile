@@ -84,8 +84,8 @@ pipeline {
                 '''
             }
         }
-   
-        /* 
+
+        /*
         stage('Image Vulnerability Scan') {
             steps {
                 sh '''
@@ -129,38 +129,24 @@ pipeline {
             }
         }
 
-        stage('Rolling Deployment') {
+        stage('Rolling Deployment with Rollback') {
+
             steps {
+
                 sshagent(credentials: ['taskboard-deploy-key']) {
 
                     sh '''
                         set -e
 
-                        deploy_server() {
+                        deploy_container() {
                             HOST="$1"
-                            INSTANCE_ID="$2"
+                            IMAGE="$2"
 
-                            echo "=========================================="
-                            echo "Starting deployment"
-                            echo "Host: ${HOST}"
-                            echo "Instance: ${INSTANCE_ID}"
-                            echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
-                            echo "=========================================="
-
-                            echo "Deregistering ${INSTANCE_ID} from ALB..."
-
-                            aws elbv2 deregister-targets \
-                                --target-group-arn "${TARGET_GROUP_ARN}" \
-                                --targets Id="${INSTANCE_ID}"
-
-                            echo "Waiting for existing connections to drain..."
-                            sleep 10
-
-                            echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG}..."
+                            echo "Deploying ${IMAGE} to ${HOST}"
 
                             ssh -o StrictHostKeyChecking=no \
                                 ubuntu@"${HOST}" "
-                                    docker pull ${IMAGE_NAME}:${IMAGE_TAG}
+                                    docker pull ${IMAGE}
 
                                     docker stop taskboard || true
                                     docker rm taskboard || true
@@ -169,10 +155,15 @@ pipeline {
                                         --name taskboard \
                                         -p 5000:5000 \
                                         --restart unless-stopped \
-                                        ${IMAGE_NAME}:${IMAGE_TAG}
+                                        ${IMAGE}
                                 "
+                        }
 
-                            echo "Waiting for application health..."
+
+                        check_application_health() {
+                            HOST="$1"
+
+                            echo "Checking application health on ${HOST}..."
 
                             ssh -o StrictHostKeyChecking=no \
                                 ubuntu@"${HOST}" '
@@ -188,13 +179,12 @@ pipeline {
                                             exit 0
                                         fi
 
-                                        echo "Attempt $i/15: application not ready yet..."
+                                        echo "Attempt $i/15: application not ready..."
                                         sleep 2
                                     done
 
-                                    echo "Application failed health check."
+                                    echo "Application health check failed."
 
-                                    echo "Container status:"
                                     docker ps -a
 
                                     echo "Container logs:"
@@ -202,6 +192,26 @@ pipeline {
 
                                     exit 1
                                 '
+                        }
+
+
+                        deregister_target() {
+                            INSTANCE_ID="$1"
+
+                            echo "Deregistering ${INSTANCE_ID} from ALB..."
+
+                            aws elbv2 deregister-targets \
+                                --target-group-arn "${TARGET_GROUP_ARN}" \
+                                --targets Id="${INSTANCE_ID}"
+
+                            echo "Waiting for connections to drain..."
+
+                            sleep 10
+                        }
+
+
+                        register_target() {
+                            INSTANCE_ID="$1"
 
                             echo "Registering ${INSTANCE_ID} with ALB..."
 
@@ -209,7 +219,7 @@ pipeline {
                                 --target-group-arn "${TARGET_GROUP_ARN}" \
                                 --targets Id="${INSTANCE_ID}"
 
-                            echo "Waiting for ALB health check..."
+                            echo "Waiting for ALB health..."
 
                             for i in $(seq 1 15); do
 
@@ -222,29 +232,225 @@ pipeline {
                                 echo "ALB target state: ${STATE}"
 
                                 if [ "${STATE}" = "healthy" ]; then
-                                    echo "ALB considers ${HOST} healthy."
+                                    echo "ALB considers target healthy."
                                     return 0
                                 fi
 
                                 sleep 5
                             done
 
-                            echo "ALB health check failed for ${HOST}."
+                            echo "ALB health check failed."
 
                             return 1
                         }
 
+
+                        get_previous_image() {
+                            HOST="$1"
+
+                            ssh -o StrictHostKeyChecking=no \
+                                ubuntu@"${HOST}" \
+                                "docker inspect taskboard --format '{{.Config.Image}}'"
+                        }
+
+
+                        rollback_server() {
+                            HOST="$1"
+                            INSTANCE_ID="$2"
+                            PREVIOUS_IMAGE="$3"
+
+                            echo "=========================================="
+                            echo "ROLLBACK"
+                            echo "Host: ${HOST}"
+                            echo "Previous image: ${PREVIOUS_IMAGE}"
+                            echo "=========================================="
+
+                            echo "Ensuring target is deregistered..."
+
+                            aws elbv2 deregister-targets \
+                                --target-group-arn "${TARGET_GROUP_ARN}" \
+                                --targets Id="${INSTANCE_ID}" || true
+
+                            sleep 5
+
+                            echo "Restoring ${PREVIOUS_IMAGE}..."
+
+                            ssh -o StrictHostKeyChecking=no \
+                                ubuntu@"${HOST}" "
+                                    docker pull ${PREVIOUS_IMAGE}
+
+                                    docker stop taskboard || true
+                                    docker rm taskboard || true
+
+                                    docker run -d \
+                                        --name taskboard \
+                                        -p 5000:5000 \
+                                        --restart unless-stopped \
+                                        ${PREVIOUS_IMAGE}
+                                "
+
+                            echo "Checking rollback application health..."
+
+                            check_application_health "${HOST}"
+
+                            echo "Registering restored target..."
+
+                            register_target "${INSTANCE_ID}"
+
+                            echo "Rollback completed successfully."
+                        }
+
+
                         echo "=========================================="
-                        echo "Rolling deployment started"
-                        echo "Version: ${IMAGE_NAME}:${IMAGE_TAG}"
+                        echo "Starting rolling deployment"
+                        echo "New image: ${IMAGE_NAME}:${IMAGE_TAG}"
                         echo "=========================================="
 
-                        deploy_server "${APP_A_HOST}" "${APP_A_ID}"
 
-                        echo "App-A deployment successful."
-                        echo "Proceeding to App-B..."
+                        echo "Getting current image from App-A..."
 
-                        deploy_server "${APP_B_HOST}" "${APP_B_ID}"
+                        PREVIOUS_APP_A=$(get_previous_image "${APP_A_HOST}")
+
+                        echo "App-A current image: ${PREVIOUS_APP_A}"
+
+
+                        echo "Getting current image from App-B..."
+
+                        PREVIOUS_APP_B=$(get_previous_image "${APP_B_HOST}")
+
+                        echo "App-B current image: ${PREVIOUS_APP_B}"
+
+
+                        echo "=========================================="
+                        echo "Deploying App-A"
+                        echo "=========================================="
+
+
+                        deregister_target "${APP_A_ID}"
+
+
+                        if ! deploy_container \
+                            "${APP_A_HOST}" \
+                            "${IMAGE_NAME}:${IMAGE_TAG}"; then
+
+                            echo "App-A deployment command failed."
+
+                            rollback_server \
+                                "${APP_A_HOST}" \
+                                "${APP_A_ID}" \
+                                "${PREVIOUS_APP_A}"
+
+                            exit 1
+                        fi
+
+
+                        if ! check_application_health "${APP_A_HOST}"; then
+
+                            echo "App-A health check failed."
+
+                            rollback_server \
+                                "${APP_A_HOST}" \
+                                "${APP_A_ID}" \
+                                "${PREVIOUS_APP_A}"
+
+                            exit 1
+                        fi
+
+
+                        if ! register_target "${APP_A_ID}"; then
+
+                            echo "App-A ALB health check failed."
+
+                            rollback_server \
+                                "${APP_A_HOST}" \
+                                "${APP_A_ID}" \
+                                "${PREVIOUS_APP_A}"
+
+                            exit 1
+                        fi
+
+
+                        echo "App-A successfully deployed."
+
+
+                        echo "=========================================="
+                        echo "Deploying App-B"
+                        echo "=========================================="
+
+
+                        deregister_target "${APP_B_ID}"
+
+
+                        if ! deploy_container \
+                            "${APP_B_HOST}" \
+                            "${IMAGE_NAME}:${IMAGE_TAG}"; then
+
+                            echo "App-B deployment command failed."
+
+                            echo "Rolling back App-A..."
+
+                            rollback_server \
+                                "${APP_A_HOST}" \
+                                "${APP_A_ID}" \
+                                "${PREVIOUS_APP_A}"
+
+                            echo "Rolling back App-B..."
+
+                            rollback_server \
+                                "${APP_B_HOST}" \
+                                "${APP_B_ID}" \
+                                "${PREVIOUS_APP_B}"
+
+                            exit 1
+                        fi
+
+
+                        if ! check_application_health "${APP_B_HOST}"; then
+
+                            echo "App-B health check failed."
+
+                            echo "Rolling back App-A..."
+
+                            rollback_server \
+                                "${APP_A_HOST}" \
+                                "${APP_A_ID}" \
+                                "${PREVIOUS_APP_A}"
+
+                            echo "Rolling back App-B..."
+
+                            rollback_server \
+                                "${APP_B_HOST}" \
+                                "${APP_B_ID}" \
+                                "${PREVIOUS_APP_B}"
+
+                            exit 1
+                        fi
+
+
+                        if ! register_target "${APP_B_ID}"; then
+
+                            echo "App-B ALB health check failed."
+
+                            echo "Rolling back App-A..."
+
+                            rollback_server \
+                                "${APP_A_HOST}" \
+                                "${APP_A_ID}" \
+                                "${PREVIOUS_APP_A}"
+
+                            echo "Rolling back App-B..."
+
+                            rollback_server \
+                                "${APP_B_HOST}" \
+                                "${APP_B_ID}" \
+                                "${PREVIOUS_APP_B}"
+
+                            exit 1
+                        fi
+
+
+                        echo "App-B successfully deployed."
+
 
                         echo "=========================================="
                         echo "Rolling deployment completed successfully."
@@ -276,7 +482,8 @@ pipeline {
         failure {
             echo "=========================================="
             echo "Pipeline failed."
-            echo "Check the failed stage and Jenkins logs."
+            echo "If deployment failed, rollback was attempted."
+            echo "Check the deployment logs for details."
             echo "=========================================="
         }
     }
