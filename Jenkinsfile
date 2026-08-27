@@ -5,16 +5,12 @@ pipeline {
         IMAGE_NAME = "rishinraj/taskboard"
         IMAGE_TAG  = "${BUILD_NUMBER}"
 
-        APP_A_HOST = "10.0.1.142"
-        APP_B_HOST = "10.0.3.38"
-
-        APP_A_ID = "i-0db344a04b6533b27"
-        APP_B_ID = "i-001b1fd77976b2a33"
+        ASG_NAME = "taskboard-asg"
 
         TARGET_GROUP_ARN = "arn:aws:elasticloadbalancing:ap-south-1:456687462288:targetgroup/taskboard-tg/30ba23715c142c08"
 
-        RDS_HOST = "taskboard-db.c50e6q6g095i.ap-south-1.rds.amazonaws.com"
-        RDS_PORT = "5432"
+        RDS_HOST     = "taskboard-db.c50e6q6g095i.ap-south-1.rds.amazonaws.com"
+        RDS_PORT     = "5432"
         RDS_DATABASE = "postgres"
     }
 
@@ -62,13 +58,17 @@ pipeline {
 
         stage('Code Quality') {
             steps {
-                sh '.venv/bin/ruff check app.py tests/'
+                sh '''
+                    .venv/bin/ruff check app.py tests/
+                '''
             }
         }
 
         stage('Dependency Vulnerability Scan') {
             steps {
-                sh '.venv/bin/pip-audit -r requirements.txt'
+                sh '''
+                    .venv/bin/pip-audit -r requirements.txt
+                '''
             }
         }
 
@@ -108,6 +108,8 @@ pipeline {
                     )
                 ]) {
                     sh '''
+                        set -e
+
                         echo "$DOCKER_PASS" | docker login \
                             -u "$DOCKER_USER" \
                             --password-stdin
@@ -124,6 +126,62 @@ pipeline {
                         docker logout
                     '''
                 }
+            }
+        }
+
+        stage('Prepare ASG') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "=========================================="
+                    echo "Preparing Auto Scaling Group"
+                    echo "=========================================="
+
+                    echo "Suspending ASG ELB health replacement..."
+
+                    aws autoscaling suspend-processes \
+                        --auto-scaling-group-name "${ASG_NAME}" \
+                        --scaling-processes HealthCheck ReplaceUnhealthy
+
+                    echo "Setting ASG capacity to 2..."
+
+                    aws autoscaling update-auto-scaling-group \
+                        --auto-scaling-group-name "${ASG_NAME}" \
+                        --min-size 2 \
+                        --desired-capacity 2 \
+                        --max-size 4
+
+                    echo "Waiting for ASG instances..."
+
+                    for i in $(seq 1 30); do
+
+                        COUNT=$(aws autoscaling describe-auto-scaling-groups \
+                            --auto-scaling-group-names "${ASG_NAME}" \
+                            --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService`])' \
+                            --output text)
+
+                        echo "InService instances: ${COUNT}"
+
+                        if [ "${COUNT}" -ge 2 ]; then
+                            break
+                        fi
+
+                        sleep 10
+                    done
+
+                    COUNT=$(aws autoscaling describe-auto-scaling-groups \
+                        --auto-scaling-group-names "${ASG_NAME}" \
+                        --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService`])' \
+                        --output text)
+
+                    if [ "${COUNT}" -lt 2 ]; then
+                        echo "ERROR: ASG did not provide two InService instances."
+                        exit 1
+                    fi
+
+                    echo "Two ASG instances are ready."
+                '''
             }
         }
 
@@ -144,7 +202,8 @@ pipeline {
                             set -e
 
                             echo "=========================================="
-                            echo "Starting deployment: ${IMAGE_NAME}:${IMAGE_TAG}"
+                            echo "Starting Rolling Deployment"
+                            echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
                             echo "=========================================="
 
 
@@ -164,26 +223,55 @@ print(
 ')
 
 
-                            deploy() {
-
-                                HOST="$1"
-                                INSTANCE_ID="$2"
-
-                                echo "------------------------------------------"
-                                echo "Deploying to ${HOST}"
-                                echo "------------------------------------------"
+                            INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+                                --auto-scaling-group-names "${ASG_NAME}" \
+                                --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+                                --output text)
 
 
-                                PREVIOUS_IMAGE=$(ssh \
+                            if [ -z "${INSTANCE_IDS}" ] || [ "${INSTANCE_IDS}" = "None" ]; then
+                                echo "ERROR: No ASG instances found."
+                                exit 1
+                            fi
+
+
+                            echo "ASG instances:"
+                            echo "${INSTANCE_IDS}"
+
+
+                            for INSTANCE_ID in ${INSTANCE_IDS}; do
+
+                                echo ""
+                                echo "=========================================="
+                                echo "Processing ${INSTANCE_ID}"
+                                echo "=========================================="
+
+
+                                PRIVATE_IP=$(aws ec2 describe-instances \
+                                    --instance-ids "${INSTANCE_ID}" \
+                                    --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+                                    --output text)
+
+
+                                echo "Private IP: ${PRIVATE_IP}"
+
+
+                                if [ -z "${PRIVATE_IP}" ] || [ "${PRIVATE_IP}" = "None" ]; then
+                                    echo "ERROR: Could not find private IP."
+                                    exit 1
+                                fi
+
+
+                                echo "Testing SSH..."
+
+                                ssh \
                                     -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" \
-                                    "docker inspect taskboard --format '{{.Config.Image}}'")
+                                    -o ConnectTimeout=10 \
+                                    ubuntu@"${PRIVATE_IP}" \
+                                    "echo SSH connection successful"
 
 
-                                echo "Previous image: ${PREVIOUS_IMAGE}"
-
-
-                                echo "Deregistering from ALB..."
+                                echo "Deregistering instance from ALB..."
 
                                 aws elbv2 deregister-targets \
                                     --target-group-arn "${TARGET_GROUP_ARN}" \
@@ -193,20 +281,36 @@ print(
                                 sleep 10
 
 
-                                echo "Creating database configuration..."
+                                echo "Saving previous image..."
 
-                                printf 'DATABASE_URL=%s\\n' "$DATABASE_URL" |
+                                PREVIOUS_IMAGE=$(ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${PRIVATE_IP}" \
+                                    "docker inspect taskboard --format '{{.Config.Image}}' 2>/dev/null || true")
+
+
+                                if [ -z "${PREVIOUS_IMAGE}" ]; then
+                                    PREVIOUS_IMAGE="${IMAGE_NAME}:latest"
+                                fi
+
+
+                                echo "Previous image: ${PREVIOUS_IMAGE}"
+
+
+                                echo "Creating deployment environment..."
+
+                                printf 'DATABASE_URL=%s\\n' "${DATABASE_URL}" |
                                     ssh \
                                     -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" \
+                                    ubuntu@"${PRIVATE_IP}" \
                                     'cat > /tmp/taskboard.env && chmod 600 /tmp/taskboard.env'
 
 
-                                echo "Pulling new image..."
+                                echo "Pulling build ${IMAGE_TAG}..."
 
                                 ssh \
                                     -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" \
+                                    ubuntu@"${PRIVATE_IP}" \
                                     "docker pull ${IMAGE_NAME}:${IMAGE_TAG}"
 
 
@@ -214,7 +318,7 @@ print(
 
                                 ssh \
                                     -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" \
+                                    ubuntu@"${PRIVATE_IP}" \
                                     "docker stop taskboard || true; docker rm taskboard || true"
 
 
@@ -222,7 +326,7 @@ print(
 
                                 ssh \
                                     -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" \
+                                    ubuntu@"${PRIVATE_IP}" \
                                     "
                                     docker run -d \
                                         --name taskboard \
@@ -233,50 +337,132 @@ print(
                                     "
 
 
-                                rm_env() {
-                                    ssh \
-                                        -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
-                                        "rm -f /tmp/taskboard.env"
-                                }
-
-
                                 echo "Checking application health..."
 
                                 HEALTHY=false
 
-                                for i in $(seq 1 15); do
+                                for i in $(seq 1 20); do
 
                                     if ssh \
                                         -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
+                                        ubuntu@"${PRIVATE_IP}" \
                                         "curl --fail --silent http://localhost:5000/health > /dev/null"; then
 
                                         HEALTHY=true
                                         break
                                     fi
 
-                                    echo "Waiting for application... ${i}/15"
-                                    sleep 2
+                                    echo "Waiting for application... ${i}/20"
+                                    sleep 3
+
                                 done
 
 
-                                if [ "$HEALTHY" != "true" ]; then
+                                if [ "${HEALTHY}" != "true" ]; then
 
-                                    echo "New deployment failed."
+                                    echo "=========================================="
+                                    echo "APPLICATION HEALTH CHECK FAILED"
+                                    echo "Rolling back..."
+                                    echo "=========================================="
 
-                                    echo "Container logs:"
+
+                                    echo "New container logs:"
+
                                     ssh \
                                         -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
+                                        ubuntu@"${PRIVATE_IP}" \
                                         "docker logs taskboard || true"
 
 
-                                    echo "Rolling back to ${PREVIOUS_IMAGE}..."
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${PRIVATE_IP}" \
+                                        "
+                                        docker stop taskboard || true
+                                        docker rm taskboard || true
+
+                                        docker pull ${PREVIOUS_IMAGE}
+
+                                        docker run -d \
+                                            --name taskboard \
+                                            -p 5000:5000 \
+                                            --restart unless-stopped \
+                                            --env-file /tmp/taskboard.env \
+                                            ${PREVIOUS_IMAGE}
+                                        "
+
+
+                                    sleep 5
+
+
+                                    echo "Checking rollback health..."
 
                                     ssh \
                                         -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
+                                        ubuntu@"${PRIVATE_IP}" \
+                                        "curl --fail --silent http://localhost:5000/health > /dev/null"
+
+
+                                    echo "Registering rolled-back instance..."
+
+                                    aws elbv2 register-targets \
+                                        --target-group-arn "${TARGET_GROUP_ARN}" \
+                                        --targets Id="${INSTANCE_ID}"
+
+
+                                    exit 1
+                                fi
+
+
+                                echo "Application health check PASSED."
+
+
+                                echo "Registering new version with ALB..."
+
+                                aws elbv2 register-targets \
+                                    --target-group-arn "${TARGET_GROUP_ARN}" \
+                                    --targets Id="${INSTANCE_ID}"
+
+
+                                echo "Waiting for ALB health..."
+
+                                ALB_HEALTHY=false
+
+                                for i in $(seq 1 20); do
+
+                                    STATE=$(aws elbv2 describe-target-health \
+                                        --target-group-arn "${TARGET_GROUP_ARN}" \
+                                        --targets Id="${INSTANCE_ID}" \
+                                        --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+                                        --output text)
+
+                                    echo "ALB state: ${STATE}"
+
+                                    if [ "${STATE}" = "healthy" ]; then
+                                        ALB_HEALTHY=true
+                                        break
+                                    fi
+
+                                    sleep 5
+                                done
+
+
+                                if [ "${ALB_HEALTHY}" != "true" ]; then
+
+                                    echo "=========================================="
+                                    echo "ALB HEALTH CHECK FAILED"
+                                    echo "Rolling back..."
+                                    echo "=========================================="
+
+
+                                    aws elbv2 deregister-targets \
+                                        --target-group-arn "${TARGET_GROUP_ARN}" \
+                                        --targets Id="${INSTANCE_ID}"
+
+
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${PRIVATE_IP}" \
                                         "
                                         docker stop taskboard || true
                                         docker rm taskboard || true
@@ -297,19 +483,9 @@ print(
 
                                     ssh \
                                         -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
-                                        "rm -f /tmp/taskboard.env"
-
-
-                                    echo "Checking rollback health..."
-
-                                    ssh \
-                                        -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
+                                        ubuntu@"${PRIVATE_IP}" \
                                         "curl --fail --silent http://localhost:5000/health > /dev/null"
 
-
-                                    echo "Registering rolled-back target..."
 
                                     aws elbv2 register-targets \
                                         --target-group-arn "${TARGET_GROUP_ARN}" \
@@ -320,58 +496,22 @@ print(
                                 fi
 
 
-                                echo "Application health check passed."
+                                echo "ALB health check PASSED."
 
 
-                                rm_env
+                                ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${PRIVATE_IP}" \
+                                    "rm -f /tmp/taskboard.env"
 
 
-                                echo "Registering target with ALB..."
+                                echo "Deployment successful on ${INSTANCE_ID}."
 
-                                aws elbv2 register-targets \
-                                    --target-group-arn "${TARGET_GROUP_ARN}" \
-                                    --targets Id="${INSTANCE_ID}"
-
-
-                                echo "Waiting for ALB health..."
-
-                                for i in $(seq 1 15); do
-
-                                    STATE=$(aws elbv2 describe-target-health \
-                                        --target-group-arn "${TARGET_GROUP_ARN}" \
-                                        --targets Id="${INSTANCE_ID}" \
-                                        --query 'TargetHealthDescriptions[0].TargetHealth.State' \
-                                        --output text)
-
-                                    echo "ALB state: ${STATE}"
-
-                                    if [ "$STATE" = "healthy" ]; then
-                                        echo "ALB health check passed."
-                                        return 0
-                                    fi
-
-                                    sleep 5
-                                done
-
-
-                                echo "ALB health check failed."
-
-                                return 1
-                            }
-
-
-                            deploy "${APP_A_HOST}" "${APP_A_ID}"
-
-                            echo "App-A deployment successful."
-
-                            deploy "${APP_B_HOST}" "${APP_B_ID}"
-
-                            echo "App-B deployment successful."
+                            done
 
 
                             echo "=========================================="
-                            echo "Rolling deployment completed successfully."
-                            echo "Version: ${IMAGE_NAME}:${IMAGE_TAG}"
+                            echo "All ASG instances deployed successfully."
                             echo "=========================================="
                         '''
                     }
@@ -383,20 +523,35 @@ print(
     post {
 
         always {
+
             archiveArtifacts(
                 artifacts: 'htmlcov/**',
                 allowEmptyArchive: true
             )
+
+            echo "Resuming ASG health processes..."
+
+            sh '''
+                aws autoscaling resume-processes \
+                    --auto-scaling-group-name "${ASG_NAME}" \
+                    --scaling-processes HealthCheck ReplaceUnhealthy \
+                    || true
+            '''
         }
 
         success {
+            echo "=========================================="
             echo "Pipeline succeeded."
-            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} deployed successfully to both application servers."
+            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "deployed successfully to the ASG."
+            echo "=========================================="
         }
 
         failure {
+            echo "=========================================="
             echo "Pipeline failed."
-            echo "Check the deployment logs."
+            echo "Rollback was attempted where applicable."
+            echo "=========================================="
         }
     }
 }
