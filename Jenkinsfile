@@ -76,8 +76,7 @@ pipeline {
             steps {
                 sh '''
                     docker build \
-                        -t taskboard:${BUILD_NUMBER} \
-                        -t taskboard:latest \
+                        -t ${IMAGE_NAME}:${BUILD_NUMBER} \
                         .
                 '''
             }
@@ -88,11 +87,10 @@ pipeline {
             steps {
                 sh '''
                     trivy image \
-                        --cache-dir /var/cache/trivy \
                         --severity HIGH,CRITICAL \
                         --ignore-unfixed \
                         --exit-code 1 \
-                        taskboard:${BUILD_NUMBER}
+                        ${IMAGE_NAME}:${BUILD_NUMBER}
                 '''
             }
         }
@@ -114,14 +112,7 @@ pipeline {
                             -u "$DOCKER_USER" \
                             --password-stdin
 
-                        docker tag taskboard:${BUILD_NUMBER} \
-                            ${IMAGE_NAME}:${BUILD_NUMBER}
-
-                        docker tag taskboard:${BUILD_NUMBER} \
-                            ${IMAGE_NAME}:latest
-
                         docker push ${IMAGE_NAME}:${BUILD_NUMBER}
-                        docker push ${IMAGE_NAME}:latest
 
                         docker logout
                     '''
@@ -135,16 +126,8 @@ pipeline {
                     set -e
 
                     echo "=========================================="
-                    echo "Preparing Auto Scaling Group"
+                    echo "Preparing ASG"
                     echo "=========================================="
-
-                    echo "Suspending ASG ELB health replacement..."
-
-                    aws autoscaling suspend-processes \
-                        --auto-scaling-group-name "${ASG_NAME}" \
-                        --scaling-processes HealthCheck ReplaceUnhealthy
-
-                    echo "Setting ASG capacity to 2..."
 
                     aws autoscaling update-auto-scaling-group \
                         --auto-scaling-group-name "${ASG_NAME}" \
@@ -152,7 +135,7 @@ pipeline {
                         --desired-capacity 2 \
                         --max-size 4
 
-                    echo "Waiting for ASG instances..."
+                    echo "Waiting for two ASG instances..."
 
                     for i in $(seq 1 30); do
 
@@ -176,11 +159,9 @@ pipeline {
                         --output text)
 
                     if [ "${COUNT}" -lt 2 ]; then
-                        echo "ERROR: ASG did not provide two InService instances."
+                        echo "ERROR: ASG did not reach 2 InService instances."
                         exit 1
                     fi
-
-                    echo "Two ASG instances are ready."
                 '''
             }
         }
@@ -203,7 +184,7 @@ pipeline {
 
                             echo "=========================================="
                             echo "Starting Rolling Deployment"
-                            echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+                            echo "Build: ${IMAGE_TAG}"
                             echo "=========================================="
 
 
@@ -223,27 +204,27 @@ print(
 ')
 
 
+                            #
+                            # Get ASG instances
+                            #
                             INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
                                 --auto-scaling-group-names "${ASG_NAME}" \
                                 --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
                                 --output text)
 
 
-                            if [ -z "${INSTANCE_IDS}" ] || [ "${INSTANCE_IDS}" = "None" ]; then
-                                echo "ERROR: No ASG instances found."
-                                exit 1
-                            fi
-
-
                             echo "ASG instances:"
                             echo "${INSTANCE_IDS}"
 
 
+                            #
+                            # Deploy one instance at a time
+                            #
                             for INSTANCE_ID in ${INSTANCE_IDS}; do
 
                                 echo ""
                                 echo "=========================================="
-                                echo "Processing ${INSTANCE_ID}"
+                                echo "Deploying to ${INSTANCE_ID}"
                                 echo "=========================================="
 
 
@@ -256,33 +237,40 @@ print(
                                 echo "Private IP: ${PRIVATE_IP}"
 
 
-                                if [ -z "${PRIVATE_IP}" ] || [ "${PRIVATE_IP}" = "None" ]; then
-                                    echo "ERROR: Could not find private IP."
+                                #
+                                # Wait for SSH
+                                #
+                                echo "Waiting for SSH..."
+
+                                SSH_READY=false
+
+                                for i in $(seq 1 30); do
+
+                                    if ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        -o ConnectTimeout=5 \
+                                        ubuntu@"${PRIVATE_IP}" \
+                                        "echo SSH connection successful"; then
+
+                                        SSH_READY=true
+                                        break
+                                    fi
+
+                                    echo "SSH not ready... ${i}/30"
+                                    sleep 5
+
+                                done
+
+
+                                if [ "${SSH_READY}" != "true" ]; then
+                                    echo "ERROR: SSH unavailable on ${PRIVATE_IP}"
                                     exit 1
                                 fi
 
 
-                                echo "Testing SSH..."
-
-                                ssh \
-                                    -o StrictHostKeyChecking=no \
-                                    -o ConnectTimeout=10 \
-                                    ubuntu@"${PRIVATE_IP}" \
-                                    "echo SSH connection successful"
-
-
-                                echo "Deregistering instance from ALB..."
-
-                                aws elbv2 deregister-targets \
-                                    --target-group-arn "${TARGET_GROUP_ARN}" \
-                                    --targets Id="${INSTANCE_ID}"
-
-
-                                sleep 10
-
-
-                                echo "Saving previous image..."
-
+                                #
+                                # Get previous image
+                                #
                                 PREVIOUS_IMAGE=$(ssh \
                                     -o StrictHostKeyChecking=no \
                                     ubuntu@"${PRIVATE_IP}" \
@@ -297,8 +285,22 @@ print(
                                 echo "Previous image: ${PREVIOUS_IMAGE}"
 
 
-                                echo "Creating deployment environment..."
+                                #
+                                # Remove this instance from ALB
+                                #
+                                echo "Deregistering ${INSTANCE_ID}..."
 
+                                aws elbv2 deregister-targets \
+                                    --target-group-arn "${TARGET_GROUP_ARN}" \
+                                    --targets Id="${INSTANCE_ID}"
+
+
+                                sleep 10
+
+
+                                #
+                                # Transfer database configuration
+                                #
                                 printf 'DATABASE_URL=%s\\n' "${DATABASE_URL}" |
                                     ssh \
                                     -o StrictHostKeyChecking=no \
@@ -306,7 +308,10 @@ print(
                                     'cat > /tmp/taskboard.env && chmod 600 /tmp/taskboard.env'
 
 
-                                echo "Pulling build ${IMAGE_TAG}..."
+                                #
+                                # Pull new image
+                                #
+                                echo "Pulling ${IMAGE_NAME}:${IMAGE_TAG}..."
 
                                 ssh \
                                     -o StrictHostKeyChecking=no \
@@ -314,6 +319,9 @@ print(
                                     "docker pull ${IMAGE_NAME}:${IMAGE_TAG}"
 
 
+                                #
+                                # Stop old container
+                                #
                                 echo "Stopping old container..."
 
                                 ssh \
@@ -322,6 +330,9 @@ print(
                                     "docker stop taskboard || true; docker rm taskboard || true"
 
 
+                                #
+                                # Start new container
+                                #
                                 echo "Starting new container..."
 
                                 ssh \
@@ -337,6 +348,9 @@ print(
                                     "
 
 
+                                #
+                                # Application health check
+                                #
                                 echo "Checking application health..."
 
                                 HEALTHY=false
@@ -358,15 +372,16 @@ print(
                                 done
 
 
+                                #
+                                # APPLICATION FAILURE → ROLLBACK
+                                #
                                 if [ "${HEALTHY}" != "true" ]; then
 
                                     echo "=========================================="
                                     echo "APPLICATION HEALTH CHECK FAILED"
-                                    echo "Rolling back..."
+                                    echo "Rolling back ${INSTANCE_ID}"
                                     echo "=========================================="
 
-
-                                    echo "New container logs:"
 
                                     ssh \
                                         -o StrictHostKeyChecking=no \
@@ -395,20 +410,18 @@ print(
                                     sleep 5
 
 
-                                    echo "Checking rollback health..."
-
                                     ssh \
                                         -o StrictHostKeyChecking=no \
                                         ubuntu@"${PRIVATE_IP}" \
                                         "curl --fail --silent http://localhost:5000/health > /dev/null"
 
 
-                                    echo "Registering rolled-back instance..."
-
                                     aws elbv2 register-targets \
                                         --target-group-arn "${TARGET_GROUP_ARN}" \
                                         --targets Id="${INSTANCE_ID}"
 
+
+                                    echo "Rollback successful."
 
                                     exit 1
                                 fi
@@ -417,13 +430,19 @@ print(
                                 echo "Application health check PASSED."
 
 
-                                echo "Registering new version with ALB..."
+                                #
+                                # Register new version
+                                #
+                                echo "Registering ${INSTANCE_ID} with ALB..."
 
                                 aws elbv2 register-targets \
                                     --target-group-arn "${TARGET_GROUP_ARN}" \
                                     --targets Id="${INSTANCE_ID}"
 
 
+                                #
+                                # Wait for ALB health
+                                #
                                 echo "Waiting for ALB health..."
 
                                 ALB_HEALTHY=false
@@ -439,19 +458,25 @@ print(
                                     echo "ALB state: ${STATE}"
 
                                     if [ "${STATE}" = "healthy" ]; then
+
                                         ALB_HEALTHY=true
                                         break
+
                                     fi
 
                                     sleep 5
+
                                 done
 
 
+                                #
+                                # ALB FAILURE → ROLLBACK
+                                #
                                 if [ "${ALB_HEALTHY}" != "true" ]; then
 
                                     echo "=========================================="
                                     echo "ALB HEALTH CHECK FAILED"
-                                    echo "Rolling back..."
+                                    echo "Rolling back ${INSTANCE_ID}"
                                     echo "=========================================="
 
 
@@ -492,6 +517,8 @@ print(
                                         --targets Id="${INSTANCE_ID}"
 
 
+                                    echo "Rollback successful."
+
                                     exit 1
                                 fi
 
@@ -510,8 +537,9 @@ print(
                             done
 
 
+                            echo ""
                             echo "=========================================="
-                            echo "All ASG instances deployed successfully."
+                            echo "ROLLING DEPLOYMENT COMPLETED"
                             echo "=========================================="
                         '''
                     }
@@ -523,20 +551,10 @@ print(
     post {
 
         always {
-
             archiveArtifacts(
                 artifacts: 'htmlcov/**',
                 allowEmptyArchive: true
             )
-
-            echo "Resuming ASG health processes..."
-
-            sh '''
-                aws autoscaling resume-processes \
-                    --auto-scaling-group-name "${ASG_NAME}" \
-                    --scaling-processes HealthCheck ReplaceUnhealthy \
-                    || true
-            '''
         }
 
         success {
@@ -550,7 +568,7 @@ print(
         failure {
             echo "=========================================="
             echo "Pipeline failed."
-            echo "Rollback was attempted where applicable."
+            echo "Check the deployment logs."
             echo "=========================================="
         }
     }
