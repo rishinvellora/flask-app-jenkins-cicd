@@ -15,7 +15,7 @@ pipeline {
 
         RDS_HOST = "taskboard-db.c50e6q6g095i.ap-south-1.rds.amazonaws.com"
         RDS_PORT = "5432"
-        RDS_DATABASE = "taskboard-db"
+        RDS_DATABASE = "postgres"
     }
 
     stages {
