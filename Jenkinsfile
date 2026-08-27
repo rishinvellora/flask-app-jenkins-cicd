@@ -30,9 +30,7 @@ pipeline {
             steps {
                 sh '''
                     python3 -m venv .venv
-
                     .venv/bin/pip install --upgrade pip
-
                     .venv/bin/pip install -r requirements.txt
                     .venv/bin/pip install -r requirements-dev.txt
                 '''
@@ -64,17 +62,13 @@ pipeline {
 
         stage('Code Quality') {
             steps {
-                sh '''
-                    .venv/bin/ruff check app.py tests/
-                '''
+                sh '.venv/bin/ruff check app.py tests/'
             }
         }
 
         stage('Dependency Vulnerability Scan') {
             steps {
-                sh '''
-                    .venv/bin/pip-audit -r requirements.txt
-                '''
+                sh '.venv/bin/pip-audit -r requirements.txt'
             }
         }
 
@@ -133,8 +127,7 @@ pipeline {
             }
         }
 
-        stage('Rolling Deployment with Rollback') {
-
+        stage('Rolling Deployment') {
             steps {
 
                 withCredentials([
@@ -150,9 +143,8 @@ pipeline {
                         sh '''
                             set -e
 
-
                             echo "=========================================="
-                            echo "Preparing RDS database connection"
+                            echo "Starting deployment: ${IMAGE_NAME}:${IMAGE_TAG}"
                             echo "=========================================="
 
 
@@ -164,126 +156,182 @@ user = quote(os.environ["DB_USER"], safe="")
 password = quote(os.environ["DB_PASS"], safe="")
 host = os.environ["RDS_HOST"]
 port = os.environ["RDS_PORT"]
-database = os.environ["RDS_DATABASE"]
+database = quote(os.environ["RDS_DATABASE"], safe="")
 
 print(
-    f"postgresql://{user}:{password}@{host}:{port}/{database}"
+    f"postgresql://{user}:{password}@{host}:{port}/{database}?sslmode=require"
 )
 ')
 
 
-                            deploy_container() {
+                            deploy() {
+
                                 HOST="$1"
-                                IMAGE="$2"
+                                INSTANCE_ID="$2"
 
-                                echo "Deploying ${IMAGE} to ${HOST}..."
-
-                                echo "Creating temporary database environment file..."
-
-                                printf 'DATABASE_URL=%s\\n' "$DATABASE_URL" |
-                                    ssh -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
-                                        'cat > /tmp/taskboard.env && chmod 600 /tmp/taskboard.env'
+                                echo "------------------------------------------"
+                                echo "Deploying to ${HOST}"
+                                echo "------------------------------------------"
 
 
-                                echo "Pulling Docker image..."
-
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" "
-                                        docker pull ${IMAGE}
-                                    "
+                                PREVIOUS_IMAGE=$(ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${HOST}" \
+                                    "docker inspect taskboard --format '{{.Config.Image}}'")
 
 
-                                echo "Stopping previous container..."
-
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" "
-                                        docker stop taskboard || true
-                                        docker rm taskboard || true
-                                    "
+                                echo "Previous image: ${PREVIOUS_IMAGE}"
 
 
-                                echo "Starting new container..."
-
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" "
-                                        docker run -d \
-                                            --name taskboard \
-                                            -p 5000:5000 \
-                                            --restart unless-stopped \
-                                            --env-file /tmp/taskboard.env \
-                                            ${IMAGE}
-                                    "
-
-
-                                echo "Removing temporary environment file..."
-
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" "
-                                        rm -f /tmp/taskboard.env
-                                    "
-                            }
-
-
-                            check_application_health() {
-                                HOST="$1"
-
-                                echo "Checking application health on ${HOST}..."
-
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" '
-                                        for i in $(seq 1 15); do
-
-                                            if curl \
-                                                --fail \
-                                                --silent \
-                                                http://localhost:5000/health; then
-
-                                                echo
-                                                echo "Application health check passed."
-                                                exit 0
-                                            fi
-
-                                            echo "Attempt $i/15: application not ready..."
-                                            sleep 2
-                                        done
-
-                                        echo "Application health check failed."
-
-                                        echo "Container status:"
-                                        docker ps -a
-
-                                        echo "Container logs:"
-                                        docker logs taskboard
-
-                                        exit 1
-                                    '
-                            }
-
-
-                            deregister_target() {
-                                INSTANCE_ID="$1"
-
-                                echo "Deregistering ${INSTANCE_ID} from ALB..."
+                                echo "Deregistering from ALB..."
 
                                 aws elbv2 deregister-targets \
                                     --target-group-arn "${TARGET_GROUP_ARN}" \
                                     --targets Id="${INSTANCE_ID}"
 
-                                echo "Waiting for connections to drain..."
 
                                 sleep 10
-                            }
 
 
-                            register_target() {
-                                INSTANCE_ID="$1"
+                                echo "Creating database configuration..."
 
-                                echo "Registering ${INSTANCE_ID} with ALB..."
+                                printf 'DATABASE_URL=%s\\n' "$DATABASE_URL" |
+                                    ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${HOST}" \
+                                    'cat > /tmp/taskboard.env && chmod 600 /tmp/taskboard.env'
+
+
+                                echo "Pulling new image..."
+
+                                ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${HOST}" \
+                                    "docker pull ${IMAGE_NAME}:${IMAGE_TAG}"
+
+
+                                echo "Stopping old container..."
+
+                                ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${HOST}" \
+                                    "docker stop taskboard || true; docker rm taskboard || true"
+
+
+                                echo "Starting new container..."
+
+                                ssh \
+                                    -o StrictHostKeyChecking=no \
+                                    ubuntu@"${HOST}" \
+                                    "
+                                    docker run -d \
+                                        --name taskboard \
+                                        -p 5000:5000 \
+                                        --restart unless-stopped \
+                                        --env-file /tmp/taskboard.env \
+                                        ${IMAGE_NAME}:${IMAGE_TAG}
+                                    "
+
+
+                                rm_env() {
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${HOST}" \
+                                        "rm -f /tmp/taskboard.env"
+                                }
+
+
+                                echo "Checking application health..."
+
+                                HEALTHY=false
+
+                                for i in $(seq 1 15); do
+
+                                    if ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${HOST}" \
+                                        "curl --fail --silent http://localhost:5000/health > /dev/null"; then
+
+                                        HEALTHY=true
+                                        break
+                                    fi
+
+                                    echo "Waiting for application... ${i}/15"
+                                    sleep 2
+                                done
+
+
+                                if [ "$HEALTHY" != "true" ]; then
+
+                                    echo "New deployment failed."
+
+                                    echo "Container logs:"
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${HOST}" \
+                                        "docker logs taskboard || true"
+
+
+                                    echo "Rolling back to ${PREVIOUS_IMAGE}..."
+
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${HOST}" \
+                                        "
+                                        docker stop taskboard || true
+                                        docker rm taskboard || true
+
+                                        docker pull ${PREVIOUS_IMAGE}
+
+                                        docker run -d \
+                                            --name taskboard \
+                                            -p 5000:5000 \
+                                            --restart unless-stopped \
+                                            --env-file /tmp/taskboard.env \
+                                            ${PREVIOUS_IMAGE}
+                                        "
+
+
+                                    sleep 5
+
+
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${HOST}" \
+                                        "rm -f /tmp/taskboard.env"
+
+
+                                    echo "Checking rollback health..."
+
+                                    ssh \
+                                        -o StrictHostKeyChecking=no \
+                                        ubuntu@"${HOST}" \
+                                        "curl --fail --silent http://localhost:5000/health > /dev/null"
+
+
+                                    echo "Registering rolled-back target..."
+
+                                    aws elbv2 register-targets \
+                                        --target-group-arn "${TARGET_GROUP_ARN}" \
+                                        --targets Id="${INSTANCE_ID}"
+
+
+                                    exit 1
+                                fi
+
+
+                                echo "Application health check passed."
+
+
+                                rm_env
+
+
+                                echo "Registering target with ALB..."
 
                                 aws elbv2 register-targets \
                                     --target-group-arn "${TARGET_GROUP_ARN}" \
                                     --targets Id="${INSTANCE_ID}"
+
 
                                 echo "Waiting for ALB health..."
 
@@ -295,15 +343,16 @@ print(
                                         --query 'TargetHealthDescriptions[0].TargetHealth.State' \
                                         --output text)
 
-                                    echo "ALB target state: ${STATE}"
+                                    echo "ALB state: ${STATE}"
 
-                                    if [ "${STATE}" = "healthy" ]; then
-                                        echo "ALB considers target healthy."
+                                    if [ "$STATE" = "healthy" ]; then
+                                        echo "ALB health check passed."
                                         return 0
                                     fi
 
                                     sleep 5
                                 done
+
 
                                 echo "ALB health check failed."
 
@@ -311,225 +360,13 @@ print(
                             }
 
 
-                            get_previous_image() {
-                                HOST="$1"
+                            deploy "${APP_A_HOST}" "${APP_A_ID}"
 
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" \
-                                    "docker inspect taskboard --format '{{.Config.Image}}'"
-                            }
+                            echo "App-A deployment successful."
 
+                            deploy "${APP_B_HOST}" "${APP_B_ID}"
 
-                            rollback_server() {
-                                HOST="$1"
-                                INSTANCE_ID="$2"
-                                PREVIOUS_IMAGE="$3"
-
-                                echo "=========================================="
-                                echo "ROLLBACK"
-                                echo "Host: ${HOST}"
-                                echo "Previous image: ${PREVIOUS_IMAGE}"
-                                echo "=========================================="
-
-
-                                echo "Deregistering target if necessary..."
-
-                                aws elbv2 deregister-targets \
-                                    --target-group-arn "${TARGET_GROUP_ARN}" \
-                                    --targets Id="${INSTANCE_ID}" || true
-
-                                sleep 5
-
-
-                                echo "Restoring ${PREVIOUS_IMAGE}..."
-
-
-                                printf 'DATABASE_URL=%s\\n' "$DATABASE_URL" |
-                                    ssh -o StrictHostKeyChecking=no \
-                                        ubuntu@"${HOST}" \
-                                        'cat > /tmp/taskboard.env && chmod 600 /tmp/taskboard.env'
-
-
-                                ssh -o StrictHostKeyChecking=no \
-                                    ubuntu@"${HOST}" "
-                                        docker pull ${PREVIOUS_IMAGE}
-
-                                        docker stop taskboard || true
-                                        docker rm taskboard || true
-
-                                        docker run -d \
-                                            --name taskboard \
-                                            -p 5000:5000 \
-                                            --restart unless-stopped \
-                                            --env-file /tmp/taskboard.env \
-                                            ${PREVIOUS_IMAGE}
-
-                                        rm -f /tmp/taskboard.env
-                                    "
-
-
-                                echo "Checking rollback application health..."
-
-                                check_application_health "${HOST}"
-
-
-                                echo "Registering restored target..."
-
-                                register_target "${INSTANCE_ID}"
-
-                                echo "Rollback completed successfully."
-                            }
-
-
-                            echo "=========================================="
-                            echo "Starting rolling deployment"
-                            echo "New image: ${IMAGE_NAME}:${IMAGE_TAG}"
-                            echo "=========================================="
-
-
-                            echo "Getting current image from App-A..."
-
-                            PREVIOUS_APP_A=$(get_previous_image "${APP_A_HOST}")
-
-                            echo "App-A current image: ${PREVIOUS_APP_A}"
-
-
-                            echo "Getting current image from App-B..."
-
-                            PREVIOUS_APP_B=$(get_previous_image "${APP_B_HOST}")
-
-                            echo "App-B current image: ${PREVIOUS_APP_B}"
-
-
-                            echo "=========================================="
-                            echo "Deploying App-A"
-                            echo "=========================================="
-
-
-                            deregister_target "${APP_A_ID}"
-
-
-                            if ! deploy_container \
-                                "${APP_A_HOST}" \
-                                "${IMAGE_NAME}:${IMAGE_TAG}"; then
-
-                                echo "App-A deployment command failed."
-
-                                rollback_server \
-                                    "${APP_A_HOST}" \
-                                    "${APP_A_ID}" \
-                                    "${PREVIOUS_APP_A}"
-
-                                exit 1
-                            fi
-
-
-                            if ! check_application_health "${APP_A_HOST}"; then
-
-                                echo "App-A health check failed."
-
-                                rollback_server \
-                                    "${APP_A_HOST}" \
-                                    "${APP_A_ID}" \
-                                    "${PREVIOUS_APP_A}"
-
-                                exit 1
-                            fi
-
-
-                            if ! register_target "${APP_A_ID}"; then
-
-                                echo "App-A ALB health check failed."
-
-                                rollback_server \
-                                    "${APP_A_HOST}" \
-                                    "${APP_A_ID}" \
-                                    "${PREVIOUS_APP_A}"
-
-                                exit 1
-                            fi
-
-
-                            echo "App-A successfully deployed."
-
-
-                            echo "=========================================="
-                            echo "Deploying App-B"
-                            echo "=========================================="
-
-
-                            deregister_target "${APP_B_ID}"
-
-
-                            if ! deploy_container \
-                                "${APP_B_HOST}" \
-                                "${IMAGE_NAME}:${IMAGE_TAG}"; then
-
-                                echo "App-B deployment command failed."
-
-                                echo "Rolling back App-A..."
-
-                                rollback_server \
-                                    "${APP_A_HOST}" \
-                                    "${APP_A_ID}" \
-                                    "${PREVIOUS_APP_A}"
-
-                                echo "Rolling back App-B..."
-
-                                rollback_server \
-                                    "${APP_B_HOST}" \
-                                    "${APP_B_ID}" \
-                                    "${PREVIOUS_APP_B}"
-
-                                exit 1
-                            fi
-
-
-                            if ! check_application_health "${APP_B_HOST}"; then
-
-                                echo "App-B health check failed."
-
-                                echo "Rolling back App-A..."
-
-                                rollback_server \
-                                    "${APP_A_HOST}" \
-                                    "${APP_A_ID}" \
-                                    "${PREVIOUS_APP_A}"
-
-                                echo "Rolling back App-B..."
-
-                                rollback_server \
-                                    "${APP_B_HOST}" \
-                                    "${APP_B_ID}" \
-                                    "${PREVIOUS_APP_B}"
-
-                                exit 1
-                            fi
-
-
-                            if ! register_target "${APP_B_ID}"; then
-
-                                echo "App-B ALB health check failed."
-
-                                echo "Rolling back App-A..."
-
-                                rollback_server \
-                                    "${APP_A_HOST}" \
-                                    "${APP_A_ID}" \
-                                    "${PREVIOUS_APP_A}"
-
-                                echo "Rolling back App-B..."
-
-                                rollback_server \
-                                    "${APP_B_HOST}" \
-                                    "${APP_B_ID}" \
-                                    "${PREVIOUS_APP_B}"
-
-                                exit 1
-                            fi
-
-
-                            echo "App-B successfully deployed."
+                            echo "App-B deployment successful."
 
 
                             echo "=========================================="
@@ -553,19 +390,13 @@ print(
         }
 
         success {
-            echo "=========================================="
             echo "Pipeline succeeded."
-            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG}"
-            echo "deployed successfully to both application servers."
-            echo "=========================================="
+            echo "TaskBoard ${IMAGE_NAME}:${IMAGE_TAG} deployed successfully to both application servers."
         }
 
         failure {
-            echo "=========================================="
             echo "Pipeline failed."
-            echo "Rollback was attempted if deployment had started."
-            echo "Check the deployment logs for details."
-            echo "=========================================="
+            echo "Check the deployment logs."
         }
     }
 }

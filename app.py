@@ -1,7 +1,5 @@
 """
 TaskBoard - A lightweight task management REST API.
-Built for a CI/CD portfolio project: unit tests, SCA, vuln scanning,
-E2E tests, Dockerized deployment.
 """
 
 import os
@@ -9,8 +7,8 @@ import sqlite3
 from datetime import datetime, timezone
 
 import psycopg
-from flask import Flask, g, jsonify, request
 from psycopg.rows import dict_row
+from flask import Flask, g, jsonify, request
 
 app = Flask(__name__)
 
@@ -23,13 +21,15 @@ def get_db():
 
     if db is None:
         if DATABASE_URL:
-            db = g._database = psycopg.connect(
+            db = psycopg.connect(
                 DATABASE_URL,
                 row_factory=dict_row,
             )
         else:
-            db = g._database = sqlite3.connect(DATABASE)
+            db = sqlite3.connect(DATABASE)
             db.row_factory = sqlite3.Row
+
+        g._database = db
 
     return db
 
@@ -74,7 +74,14 @@ def init_db():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    try:
+        db = get_db()
+        db.execute("SELECT 1")
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception:
+        return jsonify({"status": "unhealthy"}), 503
 
 
 @app.route("/tasks", methods=["GET"])
@@ -111,13 +118,13 @@ def create_task():
             (title, 0, created_at),
         )
 
-        new_task_id = cur.fetchone()["id"]
+        task_id = cur.fetchone()["id"]
 
         db.commit()
 
-        new_task = db.execute(
+        row = db.execute(
             "SELECT * FROM tasks WHERE id = %s",
-            (new_task_id,),
+            (task_id,),
         ).fetchone()
 
     else:
@@ -129,16 +136,16 @@ def create_task():
             (title, 0, created_at),
         )
 
-        new_task_id = cur.lastrowid
+        task_id = cur.lastrowid
 
         db.commit()
 
-        new_task = db.execute(
+        row = db.execute(
             "SELECT * FROM tasks WHERE id = ?",
-            (new_task_id,),
+            (task_id,),
         ).fetchone()
 
-    return jsonify(dict(new_task)), 201
+    return jsonify(dict(row)), 201
 
 
 @app.route("/tasks/<int:task_id>", methods=["GET"])
