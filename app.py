@@ -7,8 +7,8 @@ import sqlite3
 from datetime import datetime, timezone
 
 import psycopg
-from psycopg.rows import dict_row
 from flask import Flask, g, jsonify, request
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
@@ -80,7 +80,7 @@ def health():
 
         return jsonify({"status": "ok"}), 200
 
-    except Exception:
+    except (psycopg.Error, sqlite3.Error):
         return jsonify({"status": "unhealthy"}), 503
 
 
