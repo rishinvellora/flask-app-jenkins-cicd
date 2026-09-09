@@ -1,0 +1,347 @@
+name: TaskBoard CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "github-actions-cicd" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write   # Required for AWS OIDC authentication
+  contents: read    # Required to checkout the code
+
+env:
+  IMAGE_NAME: "rishinraj/taskboard"
+  IMAGE_TAG: "${{ github.run_number }}"
+  ASG_NAME: "taskboard-asg"
+  TARGET_GROUP_ARN: "arn:aws:elasticloadbalancing:ap-south-1:456687462288:targetgroup/taskboard-tg/30ba23715c142c08"
+  RDS_HOST: "taskboard-db.c50e6q6g095i.ap-south-1.rds.amazonaws.com"
+  RDS_PORT: "5432"
+  RDS_DATABASE: "postgres"
+  AWS_REGION: "ap-south-1"
+
+jobs:
+  ci:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.4"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Unit Tests + Coverage
+        run: |
+          pytest tests/test_app.py \
+            --cov=app \
+            --cov-report=term \
+            --cov-report=html
+
+      - name: Archive Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+
+      - name: Code Quality (Ruff)
+        run: ruff check app.py tests/
+
+      - name: Dependency Vulnerability Scan (pip-audit)
+        run: pip-audit -r requirements.txt
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+          docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+
+      - name: Image Vulnerability Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
+
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASS }}
+
+      - name: Push to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push ${IMAGE_NAME}:${IMAGE_TAG}
+          docker push ${IMAGE_NAME}:latest
+
+  cd:
+    name: Continuous Deployment
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python (for URL encoding)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.4"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActionsDeploymentSession
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare ASG
+        run: |
+          set -e
+          echo "=========================================="
+          echo "Preparing ASG"
+          echo "=========================================="
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "${ASG_NAME}" \
+            --min-size 2 \
+            --desired-capacity 2 \
+            --max-size 4
+
+          echo "Waiting for two ASG instances..."
+          for i in $(seq 1 30); do
+            COUNT=$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "${ASG_NAME}" \
+              --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService`])' \
+              --output text)
+            echo "InService instances: ${COUNT}"
+            if [ "${COUNT}" -ge 2 ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          COUNT=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "${ASG_NAME}" \
+            --query 'length(AutoScalingGroups[0].Instances[?LifecycleState==`InService`])' \
+            --output text)
+
+          if [ "${COUNT}" -lt 2 ]; then
+            echo "ERROR: ASG did not reach 2 InService instances."
+            exit 1
+          fi
+
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Rolling Deployment with Double Health Checks & Rollback
+        env:
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+        run: |
+          set -e
+          echo "=========================================="
+          echo "Starting Rolling Deployment"
+          echo "Build: ${IMAGE_TAG}"
+          echo "=========================================="
+
+          DATABASE_URL=$(python3 -c '
+          import os
+          from urllib.parse import quote
+          user = quote(os.environ["DB_USER"], safe="")
+          password = quote(os.environ["DB_PASS"], safe="")
+          host = os.environ["RDS_HOST"]
+          port = os.environ["RDS_PORT"]
+          database = quote(os.environ["RDS_DATABASE"], safe="")
+          print(f"postgresql://{user}:{password}@{host}:{port}/{database}?sslmode=require")
+          ')
+
+          # 1. Discover InService ASG instances
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "${ASG_NAME}" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+            --output text)
+          echo "ASG instances: ${INSTANCE_IDS}"
+
+          # 2. Deploy one instance at a time
+          for INSTANCE_ID in ${INSTANCE_IDS}; do
+            echo ""
+            echo "=========================================="
+            echo "Deploying to ${INSTANCE_ID}"
+            echo "=========================================="
+
+            # Discover IP (supports private or public IP fallback)
+            TARGET_IP=$(aws ec2 describe-instances \
+              --instance-ids "${INSTANCE_ID}" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+
+            if [ -z "${TARGET_IP}" ] || [ "${TARGET_IP}" = "None" ]; then
+              TARGET_IP=$(aws ec2 describe-instances \
+                --instance-ids "${INSTANCE_ID}" \
+                --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+                --output text)
+            fi
+            echo "Target IP: ${TARGET_IP}"
+
+            # Wait for SSH
+            echo "Waiting for SSH..."
+            SSH_READY=false
+            for i in $(seq 1 30); do
+              if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "echo SSH connection successful"; then
+                SSH_READY=true
+                break
+              fi
+              echo "SSH not ready... ${i}/30"
+              sleep 5
+            done
+
+            if [ "${SSH_READY}" != "true" ]; then
+              echo "ERROR: SSH unavailable on ${TARGET_IP}"
+              exit 1
+            fi
+
+            # Determine previous image tag for rollback
+            PREVIOUS_IMAGE=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "docker inspect taskboard --format '{{.Config.Image}}' 2>/dev/null || true")
+            if [ -z "${PREVIOUS_IMAGE}" ]; then
+              PREVIOUS_IMAGE="${IMAGE_NAME}:latest"
+            fi
+            echo "Previous image: ${PREVIOUS_IMAGE}"
+
+            # Deregister target from ALB
+            echo "Deregistering ${INSTANCE_ID}..."
+            aws elbv2 deregister-targets \
+              --target-group-arn "${TARGET_GROUP_ARN}" \
+              --targets Id="${INSTANCE_ID}"
+            sleep 10
+
+            # Transfer environment configuration
+            printf 'DATABASE_URL=%s\n' "${DATABASE_URL}" | ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" 'cat > /tmp/taskboard.env && chmod 600 /tmp/taskboard.env'
+
+            # Pull and deploy new image
+            echo "Pulling ${IMAGE_NAME}:${IMAGE_TAG}..."
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "docker pull ${IMAGE_NAME}:${IMAGE_TAG}"
+
+            echo "Stopping old container..."
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "docker stop taskboard || true; docker rm taskboard || true"
+
+            echo "Starting new container..."
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "
+              docker run -d \
+                --name taskboard \
+                -p 5000:5000 \
+                --restart unless-stopped \
+                --env-file /tmp/taskboard.env \
+                ${IMAGE_NAME}:${IMAGE_TAG}
+            "
+
+            # Check 1: Local Application Health Check
+            echo "Checking application health..."
+            HEALTHY=false
+            for i in $(seq 1 20); do
+              if ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "curl --fail --silent http://localhost:5000/health > /dev/null"; then
+                HEALTHY=true
+                break
+              fi
+              echo "Waiting for application... ${i}/20"
+              sleep 3
+            done
+
+            # ROLLBACK 1: Application Health Failure
+            if [ "${HEALTHY}" != "true" ]; then
+              echo "=========================================="
+              echo "APPLICATION HEALTH CHECK FAILED"
+              echo "Rolling back ${INSTANCE_ID}"
+              echo "=========================================="
+              ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "docker logs taskboard || true"
+              ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "
+                docker stop taskboard || true
+                docker rm taskboard || true
+                docker pull ${PREVIOUS_IMAGE}
+                docker run -d \
+                  --name taskboard \
+                  -p 5000:5000 \
+                  --restart unless-stopped \
+                  --env-file /tmp/taskboard.env \
+                  ${PREVIOUS_IMAGE}
+              "
+              sleep 5
+              ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "curl --fail --silent http://localhost:5000/health > /dev/null"
+              aws elbv2 register-targets --target-group-arn "${TARGET_GROUP_ARN}" --targets Id="${INSTANCE_ID}"
+              echo "Rollback successful."
+              exit 1
+            fi
+            echo "Application health check PASSED."
+
+            # Register with ALB
+            echo "Registering ${INSTANCE_ID} with ALB..."
+            aws elbv2 register-targets \
+              --target-group-arn "${TARGET_GROUP_ARN}" \
+              --targets Id="${INSTANCE_ID}"
+
+            # Check 2: ALB Target Health Check
+            echo "Waiting for ALB health..."
+            ALB_HEALTHY=false
+            for i in $(seq 1 20); do
+              STATE=$(aws elbv2 describe-target-health \
+                --target-group-arn "${TARGET_GROUP_ARN}" \
+                --targets Id="${INSTANCE_ID}" \
+                --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+                --output text)
+              echo "ALB state: ${STATE}"
+              if [ "${STATE}" = "healthy" ]; then
+                ALB_HEALTHY=true
+                break
+              fi
+              sleep 5
+            done
+
+            # ROLLBACK 2: ALB Health Failure
+            if [ "${ALB_HEALTHY}" != "true" ]; then
+              echo "=========================================="
+              echo "ALB HEALTH CHECK FAILED"
+              echo "Rolling back ${INSTANCE_ID}"
+              echo "=========================================="
+              aws elbv2 deregister-targets --target-group-arn "${TARGET_GROUP_ARN}" --targets Id="${INSTANCE_ID}"
+              ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "
+                docker stop taskboard || true
+                docker rm taskboard || true
+                docker pull ${PREVIOUS_IMAGE}
+                docker run -d \
+                  --name taskboard \
+                  -p 5000:5000 \
+                  --restart unless-stopped \
+                  --env-file /tmp/taskboard.env \
+                  ${PREVIOUS_IMAGE}
+              "
+              sleep 5
+              ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "curl --fail --silent http://localhost:5000/health > /dev/null"
+              aws elbv2 register-targets --target-group-arn "${TARGET_GROUP_ARN}" --targets Id="${INSTANCE_ID}"
+              echo "Rollback successful."
+              exit 1
+            fi
+            echo "ALB health check PASSED."
+
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key ubuntu@"${TARGET_IP}" "rm -f /tmp/taskboard.env"
+            echo "Deployment successful on ${INSTANCE_ID}."
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "ROLLING DEPLOYMENT COMPLETED"
+          echo "=========================================="
